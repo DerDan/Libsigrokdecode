@@ -112,6 +112,10 @@ class Decoder(srd.Decoder):
             'values': ('yes', 'no')},
         {'id': 'invert_tx', 'desc': 'Invert TX?', 'default': 'no',
             'values': ('yes', 'no')},
+        {'id': 'count_frames', 'desc': 'Count Frames?', 'default': 'no',
+            'values': ('yes', 'no')},
+        {'id': 'measure_idle', 'desc': 'Measure Idle Time?', 'default': 'no',
+            'values': ('yes', 'no')},
     )
     annotations = (
         ('rx-data', 'RX data'),
@@ -164,6 +168,10 @@ class Decoder(srd.Decoder):
         s, halfbit = self.samplenum, self.bit_width / 2.0
         self.put(s - floor(halfbit), s + ceil(halfbit), self.out_python, data)
 
+    def puti(self, stop, data):
+        s, halfbit = self.samplenum, self.bit_width / 2.0
+        self.put(stop, s - floor(halfbit), self.out_ann, data)
+
     def putgse(self, ss, es, data):
         self.put(ss, es, self.out_ann, data)
 
@@ -191,6 +199,10 @@ class Decoder(srd.Decoder):
         self.state = ['WAIT FOR START BIT', 'WAIT FOR START BIT']
         self.databits = [[], []]
         self.break_start = [None, None]
+        self.byte_count = [0, 0]
+        self.idle_start = [None, None]
+        self.count_frames = False
+        self.measure_idle = False
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -242,8 +254,24 @@ class Decoder(srd.Decoder):
         self.startsample[rxtx] = -1
 
         self.putp(['STARTBIT', rxtx, self.startbit[rxtx]])
-        self.putg([rxtx + 2, ['Start bit', 'Start', 'S']])
+        if self.count_frames:
+            self.putg([rxtx + 2, ['Start bit (%d)' % self.byte_count[rxtx], 'Start bit', 'Start', 'S']])
+        else:
+            self.putg([rxtx + 2, ['Start bit', 'Start', 'S']])
 
+        if self.measure_idle and self.idle_start[rxtx] is not None:
+            s, halfbit = self.samplenum, self.bit_width / 2.0
+            d = (s - floor(halfbit)) - self.idle_start[rxtx]
+            if d > (0.1 * self.bit_width):
+                bits = d / self.bit_width
+                # time = format_si(d / self.samplerate, 4) + 's'
+                time = "%f ms" % (1e6 * d / self.samplerate)
+                self.puti(self.idle_start[rxtx],
+                          [rxtx + 10, ['Idle Frame %.1f Bits (%s)' % (bits, time),
+                                       'Idle %.1f B' % bits, 'I %.1f' % bits, 'I']
+                           ])
+
+        self.byte_count[rxtx] += 1
         self.state[rxtx] = 'GET DATA BITS'
 
     def get_data_bits(self, rxtx, signal):
@@ -363,6 +391,7 @@ class Decoder(srd.Decoder):
             (self.datavalue[rxtx], self.frame_valid[rxtx])])
 
         self.state[rxtx] = 'WAIT FOR START BIT'
+        self.idle_start[rxtx] = es
 
     def handle_break(self, rxtx):
         self.putpse(self.frame_start[rxtx], self.samplenum,
@@ -370,6 +399,7 @@ class Decoder(srd.Decoder):
         self.putgse(self.frame_start[rxtx], self.samplenum,
                 [rxtx + 14, ['Break condition', 'Break', 'Brk', 'B']])
         self.state[rxtx] = 'WAIT FOR START BIT'
+        self.idle_start[rxtx] = self.samplenum
 
     def get_wait_cond(self, rxtx, inv):
         # Return condititions that are suitable for Decoder.wait(). Those
@@ -434,6 +464,8 @@ class Decoder(srd.Decoder):
         opt = self.options
         inv = [opt['invert_rx'] == 'yes', opt['invert_tx'] == 'yes']
         cond_data_idx = [None] * len(has_pin)
+        self.measure_idle = opt['measure_idle'] == 'yes'
+        self.count_frames = opt['count_frames'] == 'yes'
 
         # Determine the number of samples for a complete frame's time span.
         # A period of low signal (at least) that long is a break condition.
